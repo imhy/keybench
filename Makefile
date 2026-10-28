@@ -36,6 +36,9 @@ endif
 ifeq ($(TIDESDB),1)
   BACKENDS += tidesdb
 endif
+ifeq ($(STATEENGINE),1)
+  BACKENDS += stateengine
+endif
 include $(foreach b,$(BACKENDS),backends/$(b)/backend.mk)
 
 # Memory allocator (optional, off by default, uses the system allocator).
