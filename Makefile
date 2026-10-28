@@ -36,10 +36,14 @@ endif
 ifeq ($(TIDESDB),1)
   BACKENDS += tidesdb
 endif
-ifeq ($(STATEENGINE),1)
-  BACKENDS += stateengine
-endif
-include $(foreach b,$(BACKENDS),backends/$(b)/backend.mk)
+# EXTERNAL_BACKENDS names directories holding backends that live outside this
+# tree, one <name>/backend.mk each, for example in an engine's own repository. A
+# backend is looked up in backends/ first, then in each external directory in
+# order. An external backend.mk finds its own sources through
+# $(dir $(lastword $(MAKEFILE_LIST))).
+EXTERNAL_BACKENDS ?=
+backend_mk = $(firstword $(wildcard backends/$(1)/backend.mk $(foreach d,$(EXTERNAL_BACKENDS),$(d)/$(1)/backend.mk)))
+include $(foreach b,$(BACKENDS),$(or $(call backend_mk,$(b)),$(error no backend.mk for $(b) under backends/ or EXTERNAL_BACKENDS)))
 
 # Memory allocator (optional, off by default, uses the system allocator).
 # Linking an allocator into the executable as the earliest NEEDED library makes
