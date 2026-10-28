@@ -16,6 +16,10 @@ enum
     OP_MGET,
     OP_MPUT,
     OP_MDEL,
+    /* Not data operations: kept out of the primitive-op count and the overall
+       latency percentiles, reported as their own rows. */
+    OP_CKPT,
+    OP_RESTORE,
     OP__COUNT
 };
 

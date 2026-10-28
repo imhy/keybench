@@ -56,6 +56,10 @@ const char *op_name(int op)
             return "mput";
         case OP_MDEL:
             return "mdel";
+        case OP_CKPT:
+            return "checkpoint";
+        case OP_RESTORE:
+            return "restore";
         default:
             return "?";
     }
@@ -336,9 +340,51 @@ static int l_mdel(lua_State *L)
     return 1;
 }
 
+/* kv.checkpoint() takes the next checkpoint and returns its id and the bytes it
+   wrote, or nil when the engine has no checkpoints or the checkpoint failed. */
+static int l_checkpoint(lua_State *L)
+{
+    kvlua_ctx *kc = ctx_from(L);
+    uint64_t bytes = 0;
+    uint64_t t0 = now_ns();
+    uint64_t id = store_checkpoint(kc->store, &bytes);
+    uint64_t dt = now_ns() - t0;
+    if (!id)
+    {
+        lua_pushnil(L);
+        return 1;
+    }
+    hist_record(&kc->stats.h[OP_CKPT], dt);
+    lua_pushinteger(L, (lua_Integer)id);
+    lua_pushinteger(L, (lua_Integer)bytes);
+    return 2;
+}
+
+/* kv.restore(id) replaces the store with checkpoint id and returns true, or false
+   when the engine cannot restore. It must not run beside other operations. */
+static int l_restore(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+    kvlua_ctx *kc = ctx_from(L);
+    uint64_t t0 = now_ns();
+    int rc = store_restore(kc->store, (uint64_t)id);
+    uint64_t dt = now_ns() - t0;
+    if (rc == 0) hist_record(&kc->stats.h[OP_RESTORE], dt);
+    lua_pushboolean(L, rc == 0);
+    return 1;
+}
+
+/* kv.now_ns() is the harness's monotonic clock, for timing inside a workload. */
+static int l_now_ns(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)now_ns());
+    return 1;
+}
+
 static const luaL_Reg kv_funcs[] = {{"put", l_put},     {"get", l_get},   {"del", l_del},
                                     {"range", l_range}, {"scan", l_scan}, {"mget", l_mget},
-                                    {"mput", l_mput},   {"mdel", l_mdel}, {NULL, NULL}};
+                                    {"mput", l_mput},   {"mdel", l_mdel}, {"checkpoint", l_checkpoint},
+                                    {"restore", l_restore}, {"now_ns", l_now_ns}, {NULL, NULL}};
 
 void kvlua_register(lua_State *L, kvlua_ctx *kc)
 {

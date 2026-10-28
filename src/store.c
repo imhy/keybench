@@ -30,6 +30,7 @@ static void *xmalloc(size_t n)
 struct kv_store
 {
     kv_backend *be;
+    uint64_t next_checkpoint;
 };
 
 kv_store *store_open(backend_ctor inner, unsigned seed, const char *data_dir,
@@ -37,6 +38,7 @@ kv_store *store_open(backend_ctor inner, unsigned seed, const char *data_dir,
 {
     kv_store *s = xmalloc(sizeof *s);
     s->be = inner(seed, data_dir, opts);
+    s->next_checkpoint = 0;
     return s;
 }
 
@@ -123,4 +125,18 @@ int store_range(kv_store *s, const char *lo, size_t lolen, const char *hi, size_
                 kv_range_cb cb, void *arg)
 {
     return s->be->range(s->be->ctx, lo, lolen, hi, hilen, limit, cb, arg);
+}
+
+uint64_t store_checkpoint(kv_store *s, uint64_t *bytes)
+{
+    *bytes = 0;
+    if (!s->be->checkpoint) return 0;
+    uint64_t id = __atomic_add_fetch(&s->next_checkpoint, 1, __ATOMIC_RELAXED);
+    return s->be->checkpoint(s->be->ctx, id, bytes) == 0 ? id : 0;
+}
+
+int store_restore(kv_store *s, uint64_t id)
+{
+    if (!s->be->restore) return -1;
+    return s->be->restore(s->be->ctx, id);
 }

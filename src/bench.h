@@ -56,6 +56,15 @@ typedef struct kv_backend
     void (*stats)(void *ctx, kv_stat_cb cb, void *arg);
 
     const char *(*datadir)(void *ctx);
+    /* Optional. Take checkpoint number id of everything written so far into the
+       backend's own checkpoint store, as a state backend checkpoints: ids increase,
+       other operations may run concurrently, and *bytes receives the bytes this
+       checkpoint wrote to the store. 0 on success. */
+    int (*checkpoint)(void *ctx, uint64_t id, uint64_t *bytes);
+    /* Optional. Replace the store's contents with checkpoint id, reopening the engine
+       from the checkpoint store. No other operation may run concurrently. 0 on
+       success. */
+    int (*restore)(void *ctx, uint64_t id);
 } kv_backend;
 
 typedef struct kv_options kv_options;

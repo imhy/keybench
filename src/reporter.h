@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define REPORT_MAX_OPS   8
+#define REPORT_MAX_OPS   10
 #define REPORT_MAX_SINKS 8
 
 typedef struct

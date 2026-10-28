@@ -13,6 +13,7 @@
 
 #include "backend_registry.h"
 #include "bench.h"
+#include "dirdelta.h"
 
 /* StateEngine through libstateengine.so's C ABI (stateengine-flink src/ffi.rs), the
    same handle layer the Flink bridge drives: owner lock, pacer and bounded
@@ -36,11 +37,17 @@
 #define SE_DEFAULT_MAX_PARALLELISM 128
 #define SE_KEYGROUP_PREFIX 2
 
+#define SE_RETAIN 2
+
 typedef struct
 {
     stateengine_handle h;
     pthread_mutex_t mu;
     uint32_t kg_start, kg_end; /* inclusive, routing = prefix only */
+    char dir[700];
+    char *tail;                /* open-config members after the three directories */
+    int generation;            /* bumped per restore: fresh page and value-log dirs */
+    char *meta[SE_RETAIN];     /* manifest object of each retained checkpoint */
 } se_shard;
 
 typedef struct
@@ -50,6 +57,10 @@ typedef struct
     int route_prefix;
     uint32_t max_par;
     char path[512];
+    pthread_mutex_t ckpt_mu;
+    uint64_t kept_id[SE_RETAIN];
+    int nkept;
+    uint64_t checkpoints_total, checkpoint_bytes_total;
 } se_ctx;
 
 static void *xmalloc(size_t n)
@@ -375,8 +386,182 @@ static void se_stats(void *ctx, kv_stat_cb cb, void *arg)
         se_collect((const char *)buf, &stats, &nstats, &cap);
     }
     for (int i = 0; i < nstats; i++) cb(arg, stats[i].name, stats[i].value);
+    cb(arg, "kb.checkpoints-total", (double)c->checkpoints_total);
+    cb(arg, "kb.checkpoint-bytes-total", (double)c->checkpoint_bytes_total);
     free(stats);
     free(buf);
+}
+
+static char *se_open_config(const se_shard *sh)
+{
+    char pages[800], vlog[800], ckpt[800];
+    snprintf(pages, sizeof pages, "%s/pages-g%d", sh->dir, sh->generation);
+    snprintf(vlog, sizeof vlog, "%s/vlog-g%d", sh->dir, sh->generation);
+    snprintf(ckpt, sizeof ckpt, "%s/checkpoints", sh->dir);
+    mkdir(pages, 0755);
+    mkdir(vlog, 0755);
+    mkdir(ckpt, 0755);
+    size_t n = strlen(pages) + strlen(vlog) + strlen(ckpt) + strlen(sh->tail) + 96;
+    char *cfg = xmalloc(n);
+    snprintf(cfg, n, "{\"page_dir\":\"%s\",\"value_log_dir\":\"%s\",\"checkpoint_dir\":\"%s\"%s}", pages, vlog,
+             ckpt, sh->tail);
+    return cfg;
+}
+
+/* The manifest object named by the descriptor's "meta\t<name>" line. */
+static char *se_meta_name(const char *desc)
+{
+    const char *m = strstr(desc, "meta\t");
+    if (!m) return NULL;
+    m += 5;
+    size_t len = strcspn(m, "\n");
+    char *name = xmalloc(len + 1);
+    memcpy(name, m, len);
+    name[len] = 0;
+    return name;
+}
+
+static int se_checkpoint(void *ctx, uint64_t id, uint64_t *bytes)
+{
+    se_ctx *c = ctx;
+    pthread_mutex_lock(&c->ckpt_mu);
+    dir_snapshot before, after;
+    dir_snapshot_take(&before, c->path);
+    int rc = 0, begun = 0;
+    char *meta[SE_MAX_SHARDS] = {0};
+    /* The synchronous part, under each shard's lock as a Flink barrier runs on the
+       task thread; the upload and the commit then run beside new writes, as Flink's
+       asynchronous checkpoint part does. */
+    for (int s = 0; s < c->n && rc == 0; s++)
+    {
+        pthread_mutex_lock(&c->shard[s].mu);
+        int32_t r = stateengine_engine_begin_checkpoint(c->shard[s].h, id);
+        pthread_mutex_unlock(&c->shard[s].mu);
+        if (r != STATEENGINE_OK)
+            rc = se_fail("begin_checkpoint", r);
+        else
+            begun = s + 1;
+    }
+    size_t cap = 1 << 16;
+    char *desc = xmalloc(cap);
+    for (int s = 0; s < begun && rc == 0; s++)
+    {
+        size_t len = 0;
+        int32_t r;
+        while ((r = stateengine_engine_checkpoint(c->shard[s].h, (uint8_t *)desc, cap - 1, &len)) == STATEENGINE_OK &&
+               len >= cap)
+        {
+            cap = len + 1;
+            desc = xrealloc(desc, cap);
+        }
+        if (r != STATEENGINE_OK)
+        {
+            rc = se_fail("checkpoint", r);
+            break;
+        }
+        desc[len] = 0;
+        meta[s] = se_meta_name(desc);
+        if (!meta[s]) rc = se_fail("checkpoint: descriptor has no meta line", STATEENGINE_CORRUPTION);
+    }
+    free(desc);
+    for (int s = 0; s < begun; s++)
+    {
+        int32_t r = rc == 0 ? stateengine_engine_checkpoint_committed(c->shard[s].h, id)
+                            : stateengine_engine_abort_checkpoint(c->shard[s].h, id);
+        if (r != STATEENGINE_OK && rc == 0) rc = se_fail("checkpoint_committed", r);
+    }
+    if (rc == 0)
+    {
+        if (c->nkept == SE_RETAIN)
+        {
+            for (int s = 0; s < c->n; s++)
+            {
+                free(c->shard[s].meta[0]);
+                for (int k = 1; k < SE_RETAIN; k++) c->shard[s].meta[k - 1] = c->shard[s].meta[k];
+                c->shard[s].meta[SE_RETAIN - 1] = NULL;
+            }
+            for (int k = 1; k < SE_RETAIN; k++) c->kept_id[k - 1] = c->kept_id[k];
+            c->nkept--;
+        }
+        for (int s = 0; s < c->n; s++) c->shard[s].meta[c->nkept] = meta[s];
+        c->kept_id[c->nkept++] = id;
+    }
+    else
+        for (int s = 0; s < c->n; s++) free(meta[s]);
+    dir_snapshot_take(&after, c->path);
+    *bytes = dir_snapshot_added_bytes(&before, &after);
+    dir_snapshot_free(&before);
+    dir_snapshot_free(&after);
+    if (rc == 0)
+    {
+        c->checkpoints_total++;
+        c->checkpoint_bytes_total += *bytes;
+    }
+    pthread_mutex_unlock(&c->ckpt_mu);
+    return rc;
+}
+
+static uint8_t *se_read_file(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = xmalloc(n > 0 ? (size_t)n : 1);
+    *len = fread(buf, 1, (size_t)(n > 0 ? n : 0), f);
+    fclose(f);
+    return buf;
+}
+
+/* Restore: every shard recovers from its manifest into fresh page and value-log
+   directories, over the same checkpoint store, as a Flink restore opens a new
+   engine from a retained checkpoint. */
+static int se_restore(void *ctx, uint64_t id)
+{
+    se_ctx *c = ctx;
+    int slot = -1;
+    for (int k = 0; k < c->nkept; k++)
+        if (c->kept_id[k] == id) slot = k;
+    if (slot < 0)
+    {
+        fprintf(stderr, "stateengine restore: checkpoint %llu is not retained\n", (unsigned long long)id);
+        return -1;
+    }
+    int rc = 0;
+    for (int s = 0; s < c->n; s++) pthread_mutex_lock(&c->shard[s].mu);
+    for (int s = 0; s < c->n && rc == 0; s++)
+    {
+        se_shard *sh = &c->shard[s];
+        char path[1600], old_pages[800], old_vlog[800];
+        snprintf(path, sizeof path, "%s/checkpoints/%s", sh->dir, sh->meta[slot]);
+        size_t mlen = 0;
+        uint8_t *manifest = se_read_file(path, &mlen);
+        if (!manifest)
+        {
+            fprintf(stderr, "stateengine restore: no manifest object %s\n", path);
+            rc = -1;
+            break;
+        }
+        int32_t r = stateengine_engine_close(sh->h);
+        if (r != STATEENGINE_OK) se_fail("close", r);
+        snprintf(old_pages, sizeof old_pages, "%s/pages-g%d", sh->dir, sh->generation);
+        snprintf(old_vlog, sizeof old_vlog, "%s/vlog-g%d", sh->dir, sh->generation);
+        sh->generation++;
+        char *cfg = se_open_config(sh);
+        r = stateengine_engine_recover((const uint8_t *)cfg, strlen(cfg), manifest, mlen, &sh->h);
+        free(cfg);
+        free(manifest);
+        if (r != STATEENGINE_OK)
+        {
+            rc = se_fail("recover", r);
+            break;
+        }
+        dir_remove_tree(old_pages);
+        dir_remove_tree(old_vlog);
+    }
+    for (int s = c->n - 1; s >= 0; s--) pthread_mutex_unlock(&c->shard[s].mu);
+    return rc;
 }
 
 static const char *se_version(void *ctx)
@@ -410,7 +595,10 @@ static void se_close(void *ctx)
         int32_t rc = stateengine_engine_close(c->shard[s].h);
         if (rc != STATEENGINE_OK) se_fail("close", rc);
         pthread_mutex_destroy(&c->shard[s].mu);
+        free(c->shard[s].tail);
+        for (int k = 0; k < SE_RETAIN; k++) free(c->shard[s].meta[k]);
     }
+    pthread_mutex_destroy(&c->ckpt_mu);
     nftw(c->path, se_rm_entry, 16, FTW_DEPTH | FTW_PHYS);
     free(c);
 }
@@ -477,6 +665,7 @@ kv_backend *stateengine_backend_open(unsigned seed, const char *data_dir, const 
     (void)seed;
     se_ctx *c = xmalloc(sizeof *c);
     memset(c, 0, sizeof *c);
+    pthread_mutex_init(&c->ckpt_mu, NULL);
     c->n = (int)kv_opt_int(opts, "shards", SE_DEFAULT_SHARDS);
     c->max_par = (uint32_t)kv_opt_int(opts, "max_parallelism", SE_DEFAULT_MAX_PARALLELISM);
     const char *routing = kv_opt_str(opts, "routing", "hash");
@@ -504,51 +693,47 @@ kv_backend *stateengine_backend_open(unsigned seed, const char *data_dir, const 
     {
         se_shard *sh = &c->shard[s];
         pthread_mutex_init(&sh->mu, NULL);
-        char dir[700], pages[760], vlog[760], ckpt[760];
-        snprintf(dir, sizeof dir, "%s/shard-%02d", c->path, s);
-        snprintf(pages, sizeof pages, "%s/pages", dir);
-        snprintf(vlog, sizeof vlog, "%s/vlog", dir);
-        snprintf(ckpt, sizeof ckpt, "%s/checkpoints", dir);
-        se_mkdir(dir);
-        se_mkdir(pages);
-        se_mkdir(vlog);
-        se_mkdir(ckpt);
+        snprintf(sh->dir, sizeof sh->dir, "%s/shard-%02d", c->path, s);
+        se_mkdir(sh->dir);
 
-        char cfg[8192];
-        int at = snprintf(cfg, sizeof cfg, "{\"page_dir\":\"%s\",\"value_log_dir\":\"%s\",\"checkpoint_dir\":\"%s\"",
-                          pages, vlog, ckpt);
+        /* Everything after the three directories; restore reuses it with fresh dirs. */
+        char tail[8192];
+        int at = 0;
+        tail[0] = 0;
         if (c->route_prefix)
         {
             /* KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex; end inclusive. */
             sh->kg_start = (uint32_t)(((uint64_t)s * c->max_par + (uint64_t)c->n - 1) / (uint64_t)c->n);
             sh->kg_end = (uint32_t)((((uint64_t)s + 1) * c->max_par - 1) / (uint64_t)c->n);
-            at += snprintf(cfg + at, sizeof cfg - (size_t)at, ",\"owned_key_group_start\":%u,\"owned_key_group_end\":%u",
+            at += snprintf(tail + at, sizeof tail - (size_t)at, ",\"owned_key_group_start\":%u,\"owned_key_group_end\":%u",
                            sh->kg_start, sh->kg_end);
         }
         for (size_t i = 0; i < sizeof SE_DEFAULTS / sizeof SE_DEFAULTS[0]; i++)
-            at = se_member(cfg, sizeof cfg, (size_t)at, opts, SE_DEFAULTS[i].opt, SE_DEFAULTS[i].json,
+            at = se_member(tail, sizeof tail, (size_t)at, opts, SE_DEFAULTS[i].opt, SE_DEFAULTS[i].json,
                            SE_DEFAULTS[i].dflt, SE_DEFAULTS[i].quote);
         if (budget_mb)
-            at += snprintf(cfg + at, sizeof cfg - (size_t)at, ",\"memory_process_budget_bytes\":%llu",
+            at += snprintf(tail + at, sizeof tail - (size_t)at, ",\"memory_process_budget_bytes\":%llu",
                            strtoull(budget_mb, NULL, 10) << 20);
         /* Raw extra members for knobs not listed above, e.g. config = "merge_target_pages":8 */
         const char *extra = kv_opt_str(opts, "config", NULL);
-        if (extra && *extra) at += snprintf(cfg + at, sizeof cfg - (size_t)at, ",%s", extra);
-        if (at + 2 >= (int)sizeof cfg)
+        if (extra && *extra) at += snprintf(tail + at, sizeof tail - (size_t)at, ",%s", extra);
+        if (at + 2 >= (int)sizeof tail)
         {
             fprintf(stderr, "stateengine: open config too long\n");
             abort();
         }
-        cfg[at++] = '}';
-        cfg[at] = 0;
+        sh->tail = strdup(tail);
+        sh->generation = 0;
+        char *cfg = se_open_config(sh);
         if (kv_opt_int(opts, "print_config", 0) && s == 0) fprintf(stderr, "stateengine open config: %s\n", cfg);
 
-        int32_t rc = stateengine_engine_create((const uint8_t *)cfg, (size_t)at, &sh->h);
+        int32_t rc = stateengine_engine_create((const uint8_t *)cfg, strlen(cfg), &sh->h);
         if (rc != STATEENGINE_OK)
         {
             fprintf(stderr, "stateengine open shard %d: %s (status %d)\nconfig: %s\n", s, se_status_name(rc), rc, cfg);
             abort();
         }
+        free(cfg);
     }
 
     kv_backend *be = xmalloc(sizeof *be);
@@ -563,6 +748,8 @@ kv_backend *stateengine_backend_open(unsigned seed, const char *data_dir, const 
     be->version = se_version;
     be->stats = se_stats;
     be->datadir = se_datadir;
+    be->checkpoint = se_checkpoint;
+    be->restore = se_restore;
     return be;
 }
 

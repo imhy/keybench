@@ -936,7 +936,7 @@ static summary_row summarize_point(const char *name, point_result *Rs, int nr, i
     {
         hist all;
         hist_reset(&all);
-        for (int i = 0; i < OP__COUNT; i++) hist_merge(&all, &Rs[r].stats.h[i]);
+        for (int i = 0; i < OP_CKPT; i++) hist_merge(&all, &Rs[r].stats.h[i]);
         tmp[r] = (double)hist_percentile(&all, 50);
     }
     rp.overall_p50 = (uint64_t)median_d(tmp, nr);
@@ -944,7 +944,7 @@ static summary_row summarize_point(const char *name, point_result *Rs, int nr, i
     {
         hist all;
         hist_reset(&all);
-        for (int i = 0; i < OP__COUNT; i++) hist_merge(&all, &Rs[r].stats.h[i]);
+        for (int i = 0; i < OP_CKPT; i++) hist_merge(&all, &Rs[r].stats.h[i]);
         tmp[r] = (double)hist_percentile(&all, 99);
     }
     rp.overall_p99 = (uint64_t)median_d(tmp, nr);

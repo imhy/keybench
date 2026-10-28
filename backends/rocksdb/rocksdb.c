@@ -1,5 +1,8 @@
-#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
 #include <rocksdb/c.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +10,7 @@
 
 #include "backend_registry.h"
 #include "bench.h"
+#include "dirdelta.h"
 
 static void *xmalloc(size_t n)
 {
@@ -27,7 +31,19 @@ typedef struct
     rocksdb_readoptions_t *ropt;
     int disable_wal;
     char path[256];
+    /* Checkpoints, as Flink's incremental RocksDB checkpoint makes them: SST files
+       uploaded once into store/shared, the rest into store/cp-<id>, the last
+       RDB_RETAIN checkpoints kept. */
+    char store[300];
+    pthread_mutex_t ckpt_mu;
+    uint64_t kept_id[2];
+    char **kept_sst[2];
+    int kept_n[2];
+    int nkept;
+    uint64_t checkpoints_total, checkpoint_bytes_total;
 } rdb;
+
+#define RDB_RETAIN 2
 
 /* RocksDB reports through a Status string. Busy is a write conflict, a Try again
    is the write path asking the caller to retry, and a Result incomplete is a no
@@ -150,6 +166,187 @@ static int rdb_range(void *ctx, const char *lo, size_t lolen, const char *hi, si
     return n;
 }
 
+static int ends_with(const char *s, const char *suffix)
+{
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && !strcmp(s + n - m, suffix);
+}
+
+static void rdb_drop_kept(rdb *r, int slot)
+{
+    for (int i = 0; i < r->kept_n[slot]; i++) free(r->kept_sst[slot][i]);
+    free(r->kept_sst[slot]);
+    r->kept_sst[slot] = NULL;
+    r->kept_n[slot] = 0;
+}
+
+static int rdb_sst_kept(const rdb *r, const char *name)
+{
+    for (int k = 0; k < r->nkept; k++)
+        for (int i = 0; i < r->kept_n[k]; i++)
+            if (!strcmp(r->kept_sst[k][i], name)) return 1;
+    return 0;
+}
+
+/* Native checkpoint (a hard-link copy, flushing the memtable first), then upload:
+   each SST not yet in store/shared is copied once, as Flink's shared-state registry
+   uploads it once; MANIFEST, CURRENT and OPTIONS go to store/cp-<id>. */
+static int rdb_checkpoint(void *ctx, uint64_t id, uint64_t *bytes)
+{
+    rdb *r = ctx;
+    pthread_mutex_lock(&r->ckpt_mu);
+    int rc = -1;
+    char tmp[320], shared[320], priv[340], src[700], dst[700];
+    snprintf(tmp, sizeof tmp, "%s-native", r->path);
+    snprintf(shared, sizeof shared, "%s/shared", r->store);
+    snprintf(priv, sizeof priv, "%s/cp-%llu", r->store, (unsigned long long)id);
+    dir_remove_tree(tmp);
+    dir_snapshot before, after;
+    dir_snapshot_take(&before, r->store);
+
+    char *err = NULL;
+    rocksdb_checkpoint_t *cp = rocksdb_checkpoint_object_create(r->db, &err);
+    if (!err) rocksdb_checkpoint_create(cp, tmp, 0, &err);
+    if (cp) rocksdb_checkpoint_object_destroy(cp);
+    if (err)
+    {
+        fprintf(stderr, "rocksdb checkpoint: %s\n", err);
+        free(err);
+        goto out;
+    }
+    mkdir(shared, 0755);
+    mkdir(priv, 0755);
+    DIR *d = opendir(tmp);
+    if (!d) goto out;
+    char **sst = NULL;
+    int nsst = 0, cap = 0;
+    struct dirent *e;
+    rc = 0;
+    while (rc == 0 && (e = readdir(d)))
+    {
+        if (e->d_name[0] == '.') continue;
+        snprintf(src, sizeof src, "%s/%s", tmp, e->d_name);
+        if (ends_with(e->d_name, ".sst"))
+        {
+            snprintf(dst, sizeof dst, "%s/%s", shared, e->d_name);
+            struct stat st;
+            if (stat(dst, &st) != 0 && file_copy(src, dst) < 0) rc = -1;
+            if (nsst == cap)
+            {
+                cap = cap ? cap * 2 : 64;
+                sst = realloc(sst, (size_t)cap * sizeof *sst);
+                if (!sst) abort();
+            }
+            sst[nsst++] = strdup(e->d_name);
+        }
+        else
+        {
+            snprintf(dst, sizeof dst, "%s/%s", priv, e->d_name);
+            if (file_copy(src, dst) < 0) rc = -1;
+        }
+    }
+    closedir(d);
+    dir_remove_tree(tmp);
+    if (rc != 0)
+    {
+        for (int i = 0; i < nsst; i++) free(sst[i]);
+        free(sst);
+        fprintf(stderr, "rocksdb checkpoint: upload failed\n");
+        goto out;
+    }
+    /* Retain the newest RDB_RETAIN checkpoints; drop the oldest and every shared
+       SST no retained checkpoint names, as Flink discards a subsumed checkpoint. */
+    if (r->nkept == RDB_RETAIN)
+    {
+        snprintf(dst, sizeof dst, "%s/cp-%llu", r->store, (unsigned long long)r->kept_id[0]);
+        dir_remove_tree(dst);
+        rdb_drop_kept(r, 0);
+        r->kept_id[0] = r->kept_id[1];
+        r->kept_sst[0] = r->kept_sst[1];
+        r->kept_n[0] = r->kept_n[1];
+        r->kept_sst[1] = NULL;
+        r->kept_n[1] = 0;
+        r->nkept--;
+    }
+    r->kept_id[r->nkept] = id;
+    r->kept_sst[r->nkept] = sst;
+    r->kept_n[r->nkept] = nsst;
+    r->nkept++;
+    if ((d = opendir(shared)))
+    {
+        while ((e = readdir(d)))
+            if (e->d_name[0] != '.' && !rdb_sst_kept(r, e->d_name))
+            {
+                snprintf(dst, sizeof dst, "%s/%s", shared, e->d_name);
+                remove(dst);
+            }
+        closedir(d);
+    }
+out:
+    dir_snapshot_take(&after, r->store);
+    *bytes = dir_snapshot_added_bytes(&before, &after);
+    dir_snapshot_free(&before);
+    dir_snapshot_free(&after);
+    if (rc == 0)
+    {
+        r->checkpoints_total++;
+        r->checkpoint_bytes_total += *bytes;
+    }
+    pthread_mutex_unlock(&r->ckpt_mu);
+    return rc;
+}
+
+/* Restore: a fresh DB directory holding checkpoint id's files, as Flink downloads a
+   retained checkpoint into a new local instance, then reopen. */
+static int rdb_restore(void *ctx, uint64_t id)
+{
+    rdb *r = ctx;
+    int slot = -1;
+    for (int k = 0; k < r->nkept; k++)
+        if (r->kept_id[k] == id) slot = k;
+    if (slot < 0)
+    {
+        fprintf(stderr, "rocksdb restore: checkpoint %llu is not retained\n", (unsigned long long)id);
+        return -1;
+    }
+    char src[700], dst[700], priv[340];
+    rocksdb_close(r->db);
+    r->db = NULL;
+    dir_remove_tree(r->path);
+    mkdir(r->path, 0755);
+    for (int i = 0; i < r->kept_n[slot]; i++)
+    {
+        snprintf(src, sizeof src, "%s/shared/%s", r->store, r->kept_sst[slot][i]);
+        snprintf(dst, sizeof dst, "%s/%s", r->path, r->kept_sst[slot][i]);
+        if (file_copy(src, dst) < 0) return -1;
+    }
+    snprintf(priv, sizeof priv, "%s/cp-%llu", r->store, (unsigned long long)id);
+    DIR *d = opendir(priv);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d)))
+    {
+        if (e->d_name[0] == '.') continue;
+        snprintf(src, sizeof src, "%s/%s", priv, e->d_name);
+        snprintf(dst, sizeof dst, "%s/%s", r->path, e->d_name);
+        if (file_copy(src, dst) < 0)
+        {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
+    char *err = NULL;
+    r->db = rocksdb_open(r->opts, r->path, &err);
+    if (err)
+    {
+        fprintf(stderr, "rocksdb restore open: %s\n", err);
+        free(err);
+        return -1;
+    }
+    return 0;
+}
+
 /* KB_ROCKSDB_FLAVOR names a RocksDB fork built from the same C API, such as
    frocksdb or forst, so a report says which library actually ran. The forks keep
    RocksDB's version macros, so the flavor carries the fork's own release. */
@@ -224,6 +421,8 @@ static void rdb_stats(void *ctx, kv_stat_cb cb, void *arg)
         if (rocksdb_property_int(r->db, RDB_PROPS[i], &v) == 0)
             cb(arg, RDB_PROPS[i] + 8, (double)v);
     }
+    cb(arg, "kb.checkpoints-total", (double)r->checkpoints_total);
+    cb(arg, "kb.checkpoint-bytes-total", (double)r->checkpoint_bytes_total);
 }
 
 static void rdb_close(void *ctx)
@@ -237,6 +436,9 @@ static void rdb_close(void *ctx)
     rocksdb_readoptions_destroy(r->ropt);
     rocksdb_options_destroy(r->opts);
     rmdir(r->path);
+    dir_remove_tree(r->store);
+    for (int k = 0; k < r->nkept; k++) rdb_drop_kept(r, k);
+    pthread_mutex_destroy(&r->ckpt_mu);
     free(r);
 }
 
@@ -249,6 +451,7 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
 {
     (void)seed;
     rdb *r = xmalloc(sizeof *r);
+    memset(r, 0, sizeof *r);
 
     const char *base = kv_opt_str(opts, "data_dir", data_dir);
     if (!base || !*base) base = "/tmp";
@@ -259,6 +462,15 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
         abort();
     }
 
+    snprintf(r->store, sizeof r->store, "%s-store", r->path);
+    if (mkdir(r->store, 0755))
+    {
+        perror("mkdir checkpoint store");
+        abort();
+    }
+    pthread_mutex_init(&r->ckpt_mu, NULL);
+    r->nkept = 0;
+    r->checkpoints_total = r->checkpoint_bytes_total = 0;
     r->opts = rocksdb_options_create();
     rocksdb_options_set_create_if_missing(r->opts, 1);
     r->disable_wal = 0;
@@ -320,6 +532,8 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
     be->version = rdb_version;
     be->stats = rdb_stats;
     be->datadir = rdb_datadir;
+    be->checkpoint = rdb_checkpoint;
+    be->restore = rdb_restore;
     return be;
 }
 
