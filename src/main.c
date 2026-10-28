@@ -696,10 +696,11 @@ static kv_store *measure_setup(const char *path, const config *cfg, char *name_o
             spg.stop = 1;
             pthread_join(spgtid, NULL);
         }
-        if (show)
+        /* Reported with or without a terminal, so a runner that measures the
+           load itself, as an initial-loading scenario does, can read its rate. */
         {
             double secs = (now_ns() - ls) / 1e9;
-            fprintf(stderr, "  seeded %s in %.1fs  %llu keys  %.0f keys/s\n", name, secs,
+            fprintf(stderr, "  seeded %s in %.3fs  %llu keys  %.0f keys/s\n", name, secs,
                     (unsigned long long)seeded, secs > 0 ? seeded / secs : 0.0);
         }
         free(lw);
