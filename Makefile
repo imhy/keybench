@@ -96,11 +96,11 @@ endif
 .PHONY: verify
 verify: $(BIN)
 	@echo "=== resolved at runtime ==="
-	@ldd ./$(BIN) | grep -E "rocksdb|tidesdb|jemalloc|tcmalloc" || echo "  (no engine libs linked)"
+	@ldd ./$(BIN) | grep -E "rocksdb|tidesdb|stateengine|jemalloc|tcmalloc" || echo "  (no engine libs linked)"
 	@echo "=== versions the binary reports ==="
-	@for e in rocksdb tidesdb; do \
+	@for e in $(filter-out skiplist,$(BACKENDS)); do \
 	  ./$(BIN) --backend $$e --ops 1 --threads 1 --probe none --data-dir $${TMPDIR:-/tmp} \
-	    workloads/mixed.lua 2>/dev/null | grep -oE "engine=$$e [0-9.]+" | head -1; \
+	    workloads/mixed.lua 2>/dev/null | grep -m1 -oE "^engine=.*  threads=" | sed 's/  threads=$$//'; \
 	done
 
 .PHONY: run all-wl clean

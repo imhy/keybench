@@ -20,11 +20,12 @@
 
    A Flink TaskManager runs one engine per subtask, each owning a range of key
    groups. This backend does the same: it opens `shards` engines and routes every
-   key to one of them. With routing = prefix (the default) a key starts with its
-   2-byte big-endian key group, as the Flink bridge writes it, and the key group
-   picks the shard through Flink's KeyGroupRangeAssignment. With routing = hash a
+   key to one of them. With routing = hash (the default, so any workload runs) a
    key hashes to a shard and every engine runs engine-direct, without an owned
-   key-group range.
+   key-group range. With routing = prefix a key starts with its 2-byte big-endian
+   key group, as the Flink bridge writes it, and the key group picks the shard
+   through Flink's KeyGroupRangeAssignment; each engine owns its range, as in
+   Flink. Workloads that model Flink state use prefix.
 
    An engine serves one writer at a time and refuses writes while one of its scan
    cursors is open, so each shard has a mutex held across every call and across a
@@ -478,8 +479,8 @@ kv_backend *stateengine_backend_open(unsigned seed, const char *data_dir, const 
     memset(c, 0, sizeof *c);
     c->n = (int)kv_opt_int(opts, "shards", SE_DEFAULT_SHARDS);
     c->max_par = (uint32_t)kv_opt_int(opts, "max_parallelism", SE_DEFAULT_MAX_PARALLELISM);
-    const char *routing = kv_opt_str(opts, "routing", "prefix");
-    c->route_prefix = strcmp(routing, "hash") != 0;
+    const char *routing = kv_opt_str(opts, "routing", "hash");
+    c->route_prefix = strcmp(routing, "prefix") == 0;
     if (c->n < 1 || c->n > SE_MAX_SHARDS || (c->route_prefix && (uint32_t)c->n > c->max_par) ||
         c->max_par < 1 || c->max_par > 32768)
     {
