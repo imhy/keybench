@@ -32,9 +32,11 @@
 #define DU_MAX_ENTRIES 2000000
 
 /* Upper bound on metrics gathered in one timeline sample. Engines that expose a
-   wide stat surface, tidesdb with per-level counters in particular, plus the
-   system probe and throughput, must all fit without being dropped. */
-#define SAMPLE_METRIC_MAX 256
+   wide stat surface, tidesdb with per-level counters and stateengine with several
+   hundred counters per engine in particular, plus the system probe and
+   throughput, must all fit without being dropped. A sample's array lives on the
+   sampler thread's stack, 16 B per metric. */
+#define SAMPLE_METRIC_MAX 4096
 
 static uint64_t du_bytes(const char *root)
 {
