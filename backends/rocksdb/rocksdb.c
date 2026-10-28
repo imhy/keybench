@@ -25,6 +25,7 @@ typedef struct
     rocksdb_options_t *opts;
     rocksdb_writeoptions_t *wopt;
     rocksdb_readoptions_t *ropt;
+    int disable_wal;
     char path[256];
 } rdb;
 
@@ -149,10 +150,17 @@ static int rdb_range(void *ctx, const char *lo, size_t lolen, const char *hi, si
     return n;
 }
 
+/* KB_ROCKSDB_FLAVOR names a RocksDB fork built from the same C API, such as
+   frocksdb or forst, so a report says which library actually ran. The forks keep
+   RocksDB's version macros, so the flavor carries the fork's own release. */
 static const char *rdb_version(void *ctx)
 {
     (void)ctx;
-#ifdef KB_ROCKSDB_VERSION
+#if defined(KB_ROCKSDB_FLAVOR) && defined(KB_ROCKSDB_VERSION)
+    return KB_ROCKSDB_FLAVOR " (rocksdb " KB_ROCKSDB_VERSION ")";
+#elif defined(KB_ROCKSDB_FLAVOR)
+    return KB_ROCKSDB_FLAVOR;
+#elif defined(KB_ROCKSDB_VERSION)
     return "rocksdb " KB_ROCKSDB_VERSION;
 #else
     return "rocksdb";
@@ -253,6 +261,7 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
 
     r->opts = rocksdb_options_create();
     rocksdb_options_set_create_if_missing(r->opts, 1);
+    r->disable_wal = 0;
 
     int nopt = kv_opt_count(opts);
     for (int i = 0; i < nopt; i++)
@@ -260,6 +269,14 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
         const char *k = kv_opt_key_at(opts, i);
         const char *v = kv_opt_val_at(opts, i);
         if (!strcmp(k, "data_dir")) continue;
+        /* disable_wal is a write option, not a DB option, so the options string
+           parser below cannot take it. A state backend whose durability comes from
+           checkpoints writes no WAL, and this lets a run match that. */
+        if (!strcmp(k, "disable_wal"))
+        {
+            r->disable_wal = atoi(v) != 0;
+            continue;
+        }
         char spec[512];
         snprintf(spec, sizeof spec, "%s=%s", k, v);
         rocksdb_options_t *nw = rocksdb_options_create();
@@ -286,6 +303,7 @@ kv_backend *rocksdb_backend_open(unsigned seed, const char *data_dir, const kv_o
         abort();
     }
     r->wopt = rocksdb_writeoptions_create();
+    rocksdb_writeoptions_disable_WAL(r->wopt, r->disable_wal);
     r->ropt = rocksdb_readoptions_create();
 
     kv_backend *be = xmalloc(sizeof *be);

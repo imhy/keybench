@@ -50,6 +50,15 @@ ROCKSDB_VERSION_H ?= $(ROCKSDB_INC_DIR)/rocksdb/version.h
 # time and pass them as a string define (used by rdb_version()).
 ROCKSDB_VER := $(shell awk '/define ROCKSDB_MAJOR/{a=$$3}/define ROCKSDB_MINOR/{b=$$3}/define ROCKSDB_PATCH/{c=$$3}END{if(a!="")print a"."b"."c}' $(ROCKSDB_VERSION_H) 2>/dev/null)
 
+# ROCKSDB_FLAVOR labels a fork linked through this backend, e.g. a prefix holding
+# Flink's bundled FRocksDB or ForSt library:
+#   make ROCKSDB=1 ROCKSDB_PREFIX=/opt/engines/forst-0.1.8 ROCKSDB_FLAVOR=forst-0.1.8
+# The report then names "forst-0.1.8 (rocksdb 8.10.0)" instead of plain rocksdb.
+ROCKSDB_FLAVOR ?=
+ifneq ($(ROCKSDB_FLAVOR),)
+  CFLAGS += -DKB_ROCKSDB_FLAVOR='"$(ROCKSDB_FLAVOR)"'
+endif
+
 SRC    += backends/rocksdb/rocksdb.c
 CFLAGS += $(ROCKSDB_CFLAGS)
 ifneq ($(ROCKSDB_VER),)
